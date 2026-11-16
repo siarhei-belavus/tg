@@ -90,7 +90,22 @@ pub async fn get_messages<C: TelegramClient>(
 ) -> Result<MessagesResult> {
     let chat_id = match target {
         ChatTarget::Id(id) => id,
-        ChatTarget::Name(name) => client.find_chat_by_name(&name).await?,
+        ChatTarget::Name(name) if name.starts_with('@') => {
+            let username = crate::reads::username(&name)?;
+            client.find_chat_by_username(&username).await?
+        }
+        ChatTarget::Name(name) => {
+            let candidates = client.search_contacts(&name).await?;
+            match candidates.as_slice() {
+                [contact] => contact.id,
+                [] => return Err(TgError::ContactNotFound(name)),
+                _ => {
+                    return Err(TgError::Other(
+                        "Ambiguous contact name; use --chat ID or an exact @username".into(),
+                    ));
+                }
+            }
+        }
     };
 
     let since_timestamp = since_utc.map(parse_since_date).transpose()?;
@@ -159,6 +174,30 @@ pub async fn handle<C: TelegramClient>(
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn exact_username_and_ambiguous_display_name() {
+        let mut client = crate::client::mock::MockClient::default();
+        let username = client.contacts[0].username.clone().unwrap();
+        let expected = client.contacts[0].id;
+        let result = super::get_messages(
+            &client,
+            super::ChatTarget::Name(format!("@{username}")),
+            2,
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.chat_id, expected);
+        let mut duplicate = client.contacts[0].clone();
+        duplicate.id = 99;
+        let name = duplicate.name.clone();
+        client.contacts.push(duplicate);
+        let err = super::get_messages(&client, super::ChatTarget::Name(name), 2, None, false)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("Ambiguous"));
+    }
     use super::*;
     use crate::client::mock::MockClient;
 

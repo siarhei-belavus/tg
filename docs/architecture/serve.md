@@ -43,10 +43,16 @@ are a contract with Mycelium's Telegram consumer (its spec:
   tokio's `stdin()` cannot be cancelled and would hold the runtime's shutdown — and so the exit
   after `tg serve closed the stream` — until stdin closed.
 
-**Serve request strictness:** `SendRequest`, its nested `media::SendFile`, `ReactRequest` and
-`DeleteChatRequest` — the requests that change a chat — are the only serve request structs carrying
-`#[serde(deny_unknown_fields)]`. The others are deliberately open: `WhoamiRequest{}` backs
-the container's `HealthCmd` (`tg whoami`, `HealthStartupTimeout=2m`), so tightening it risks
-the health gate for no benefit, and the remaining structs have caller sets that were never
-audited. `dispatch_other_commands_still_ignore_unknown_args` pins the decision so a later
-blanket change has to be deliberate.
+## Request strictness
+
+`SendRequest`, its nested `media::SendFile`, `ReactRequest` and `DeleteChatRequest`
+reject unknown fields. Existing read requests stay open. `WhoamiRequest{}` backs
+the container's `HealthCmd`, so tightening it risks the health check for no benefit.
+The other existing request types have caller sets that were never audited.
+`dispatch_other_commands_still_ignore_unknown_args` pins this compatibility rule.
+
+The new `reads.rs` requests, `PageRequest`, `ResolveRequest` and `LinkRequest`, reject
+unknown fields so a misspelled filter fails. Their socket commands are distinct:
+`history_page`, `thread_page`, `resolve_public` and `message_link`. An older daemon
+refuses these commands; the CLI reports that error without opening another TDLib
+client or retrying through an older command that might ignore its filters.

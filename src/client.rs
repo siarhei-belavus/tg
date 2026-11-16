@@ -105,6 +105,40 @@ fn boundary_from_probe(probe_id: Option<i64>) -> BoundaryResult {
 
 #[async_trait]
 pub trait TelegramClient: Send + Sync {
+    async fn read_public_chat(&self, _username: &str) -> Result<crate::reads::PublicChat> {
+        Err(TgError::Other(
+            "public reads are unsupported by this client".into(),
+        ))
+    }
+    async fn read_message_link(&self, _link: &str) -> Result<MessageInfo> {
+        Err(TgError::Other(
+            "message links are unsupported by this client".into(),
+        ))
+    }
+    async fn read_discussion(&self, link: &str) -> Result<crate::reads::Discussion> {
+        let post = self.read_message_link(link).await?;
+        self.read_discussion_by_id(post.chat_id, post.id).await
+    }
+    async fn read_discussion_by_id(
+        &self,
+        _chat: i64,
+        _message: i64,
+    ) -> Result<crate::reads::Discussion> {
+        Err(TgError::Other(
+            "discussions are unsupported by this client".into(),
+        ))
+    }
+    async fn read_history_batch(
+        &self,
+        _source: &crate::reads::Source,
+        _from: i64,
+        _offset: i32,
+        _limit: i32,
+    ) -> Result<Vec<MessageInfo>> {
+        Err(TgError::Other(
+            "paged reads are unsupported by this client".into(),
+        ))
+    }
     async fn authenticate(&mut self) -> Result<()>;
 
     async fn is_authenticated(&self) -> bool;
@@ -3292,6 +3326,138 @@ impl MessageHistorySource for TdLibClient {
 
 #[async_trait]
 impl TelegramClient for TdLibClient {
+    async fn read_public_chat(&self, username: &str) -> Result<crate::reads::PublicChat> {
+        let client_id = self.get_client_id().await?;
+        let chat_id = self.find_chat_by_username(username).await?;
+        let chat = unwrap_chat(
+            tdlib_rs::functions::get_chat(chat_id, client_id)
+                .await
+                .map_err(|e| TgError::TdLib(e.message))?,
+        );
+        let kind = match chat_type_kind(&chat.r#type) {
+            ChatTypeKind::Channel => "channel",
+            ChatTypeKind::Supergroup => "supergroup",
+            ChatTypeKind::BasicGroup => "group",
+            ChatTypeKind::Private => "private",
+            ChatTypeKind::Other => "other",
+        };
+        Ok(crate::reads::PublicChat {
+            id: chat.id,
+            title: chat.title,
+            kind: kind.into(),
+            username: format!("@{username}"),
+        })
+    }
+
+    async fn read_message_link(&self, link: &str) -> Result<MessageInfo> {
+        crate::reads::validate_link(link)?;
+        let client_id = self.get_client_id().await?;
+        let tdlib_rs::enums::MessageLinkInfo::MessageLinkInfo(info) =
+            tdlib_rs::functions::get_message_link_info(link.to_string(), client_id)
+                .await
+                .map_err(|e| {
+                    TgError::Other(format!(
+                        "Telegram message link is inaccessible or unsupported: {}",
+                        e.message
+                    ))
+                })?;
+        let message = info.message.ok_or_else(|| {
+            TgError::Other(
+                "Telegram message link is inaccessible or does not name a message".into(),
+            )
+        })?;
+        if info.chat_id == 0 || message.chat_id != info.chat_id {
+            return Err(TgError::Other(
+                "Telegram message link has no accessible chat".into(),
+            ));
+        }
+        self.message_infos(client_id, vec![message])
+            .await
+            .into_iter()
+            .next()
+            .ok_or_else(|| TgError::Other("Telegram message link has no message".into()))
+    }
+
+    async fn read_discussion_by_id(
+        &self,
+        chat: i64,
+        message: i64,
+    ) -> Result<crate::reads::Discussion> {
+        let client_id = self.get_client_id().await?;
+        let post = self.get_message(chat, message).await?;
+        let tdlib_rs::enums::MessageThreadInfo::MessageThreadInfo(info) =
+            tdlib_rs::functions::get_message_thread(chat, message, client_id)
+                .await
+                .map_err(|e| {
+                    TgError::Other(format!(
+                        "Discussion is inaccessible or unavailable: {}",
+                        e.message
+                    ))
+                })?;
+        if info.messages.is_empty() || info.chat_id == 0 || info.message_thread_id <= 0 {
+            return Err(TgError::Other("Discussion has no accessible root".into()));
+        }
+        let roots = self.message_infos(client_id, info.messages).await;
+        let source = crate::reads::Source::Thread {
+            post_chat_id: chat,
+            post_message_id: message,
+            chat_id: info.chat_id,
+            thread_id: info.message_thread_id,
+            root_ids: roots
+                .iter()
+                .filter(|m| m.chat_id == info.chat_id)
+                .map(|m| m.id)
+                .collect(),
+        };
+        Ok(crate::reads::Discussion {
+            source,
+            post,
+            roots,
+            reply_count: info.reply_info.map(|r| r.reply_count),
+        })
+    }
+
+    async fn read_history_batch(
+        &self,
+        source: &crate::reads::Source,
+        from: i64,
+        offset: i32,
+        limit: i32,
+    ) -> Result<Vec<MessageInfo>> {
+        match source {
+            crate::reads::Source::Chat { chat_id } => {
+                MessageHistorySource::fetch_batch(self, *chat_id, from, offset, limit).await
+            }
+            crate::reads::Source::Thread {
+                post_chat_id,
+                post_message_id,
+                ..
+            } => {
+                let client_id = self.get_client_id().await?;
+                let result = tdlib_rs::functions::get_message_thread_history(
+                    *post_chat_id,
+                    *post_message_id,
+                    from,
+                    offset,
+                    limit,
+                    client_id,
+                )
+                .await
+                .map_err(|e| TgError::TdLib(e.message))?;
+                Ok(self
+                    .message_infos(
+                        client_id,
+                        unwrap_messages(result)
+                            .messages
+                            .into_iter()
+                            .flatten()
+                            .collect(),
+                    )
+                    .await)
+            }
+        }
+    }
+
     async fn authenticate(&mut self) -> Result<()> {
         use std::io::{self, BufRead, Write};
         use tdlib_rs::enums::AuthorizationState;
@@ -3341,18 +3507,7 @@ impl TelegramClient for TdLibClient {
                     .map_err(|e| TgError::AuthFailed(e.message))?;
                 }
                 AuthorizationState::WaitCode(_) => {
-                    println!("A verification code was sent to your Telegram app.");
-                    print!("Enter the code from Telegram: ");
-                    io::stdout().flush().ok();
-                    let code = io::stdin()
-                        .lock()
-                        .lines()
-                        .next()
-                        .ok_or_else(|| TgError::Other("Failed to read code".to_string()))?
-                        .map_err(|e| TgError::Other(e.to_string()))?;
-                    tdlib_rs::functions::check_authentication_code(code, client_id)
-                        .await
-                        .map_err(|e| TgError::AuthFailed(e.message))?;
+                    crate::auth_code::prompt(client_id).await?;
                 }
                 AuthorizationState::WaitPassword(_) => {
                     print!("Enter 2FA password: ");
@@ -3418,20 +3573,7 @@ impl TelegramClient for TdLibClient {
                                 .map_err(|e| TgError::AuthFailed(e.message))?;
                             }
                             AuthorizationState::WaitCode(_) => {
-                                println!("A verification code was sent to your Telegram app.");
-                                print!("Enter the code from Telegram: ");
-                                io::stdout().flush().ok();
-                                let code = io::stdin()
-                                    .lock()
-                                    .lines()
-                                    .next()
-                                    .ok_or_else(|| {
-                                        TgError::Other("Failed to read code".to_string())
-                                    })?
-                                    .map_err(|e| TgError::Other(e.to_string()))?;
-                                tdlib_rs::functions::check_authentication_code(code, client_id)
-                                    .await
-                                    .map_err(|e| TgError::AuthFailed(e.message))?;
+                                crate::auth_code::prompt(client_id).await?;
                             }
                             AuthorizationState::WaitPassword(_) => {
                                 print!("Enter 2FA password: ");
@@ -4456,6 +4598,8 @@ pub mod mock {
         pub groups: Vec<ChatInfo>,
         pub contacts: Vec<ContactInfo>,
         pub messages: Vec<MessageInfo>,
+        pub message_links: std::collections::HashMap<String, (i64, i64)>,
+        pub discussions: std::collections::HashMap<(i64, i64), crate::reads::Discussion>,
         pub inaccessible_chat_ids: Vec<i64>,
         /// Result returned by `get_boundary_message_id`
         pub boundary_result: BoundaryResult,
@@ -4579,6 +4723,8 @@ pub mod mock {
         fn default() -> Self {
             Self {
                 authenticated: std::sync::Mutex::new(false),
+                message_links: Default::default(),
+                discussions: Default::default(),
                 phone_sent: std::sync::Mutex::new(false),
                 auth_state: std::sync::Mutex::new(AuthState::WaitPhone),
                 chats: vec![
@@ -4719,6 +4865,70 @@ pub mod mock {
 
     #[async_trait]
     impl TelegramClient for MockClient {
+        async fn read_message_link(&self, link: &str) -> Result<MessageInfo> {
+            let (chat, message) = self.message_links.get(link).ok_or_else(|| {
+                TgError::Other("Telegram message link is inaccessible or unsupported".into())
+            })?;
+            self.get_message(*chat, *message).await
+        }
+
+        async fn read_discussion_by_id(
+            &self,
+            chat: i64,
+            message: i64,
+        ) -> Result<crate::reads::Discussion> {
+            self.discussions
+                .get(&(chat, message))
+                .cloned()
+                .ok_or_else(|| TgError::Other("Discussion is inaccessible or unavailable".into()))
+        }
+
+        async fn read_public_chat(&self, username: &str) -> Result<crate::reads::PublicChat> {
+            let id = self.find_chat_by_username(username).await?;
+            let chat = self
+                .chats
+                .iter()
+                .chain(self.groups.iter())
+                .find(|c| c.id == id)
+                .ok_or_else(|| TgError::ChatNotFound(username.into()))?;
+            Ok(crate::reads::PublicChat {
+                id,
+                username: format!("@{username}"),
+                title: chat.name.clone(),
+                kind: if chat.is_channel {
+                    "channel"
+                } else {
+                    "private"
+                }
+                .into(),
+            })
+        }
+
+        async fn read_history_batch(
+            &self,
+            source: &crate::reads::Source,
+            from: i64,
+            offset: i32,
+            limit: i32,
+        ) -> Result<Vec<MessageInfo>> {
+            let mut messages: Vec<_> = self
+                .messages
+                .iter()
+                .filter(|m| m.chat_id == source.chat_id())
+                .cloned()
+                .collect();
+            messages.sort_by_key(|m| m.id);
+            if offset < 0 {
+                messages.truncate(limit as usize);
+                messages.reverse();
+            } else {
+                messages.retain(|m| from == 0 || m.id < from);
+                messages.reverse();
+                messages.truncate(limit as usize);
+            }
+            Ok(messages)
+        }
+
         async fn authenticate(&mut self) -> Result<()> {
             let state = *self.auth_state.lock().unwrap();
             match state {

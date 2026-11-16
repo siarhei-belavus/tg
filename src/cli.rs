@@ -40,6 +40,18 @@ pub enum Command {
     /// Read one message by its id, reactions included, wherever it lies in the chat
     Message(MessageArgs),
 
+    /// Resolve an exact public @username without joining
+    Resolve(ResolveArgs),
+
+    /// Read one message through TDLib's Telegram URL resolution
+    MessageLink(LinkArgs),
+
+    /// Bounded newest-first history with caller-owned cursors, always JSON
+    History(HistoryArgs),
+
+    /// Read a post's linked discussion in bounded pages, always JSON
+    Thread(ThreadArgs),
+
     /// React to a message with an emoji, or take a reaction back
     React(ReactArgs),
 
@@ -183,6 +195,51 @@ pub struct MessageArgs {
 }
 
 #[derive(Parser, Debug)]
+pub struct ResolveArgs {
+    pub username: String,
+}
+
+#[derive(Parser, Debug)]
+pub struct LinkArgs {
+    pub link: String,
+}
+
+#[derive(Parser, Debug)]
+pub struct PageArgs {
+    /// Inclusive lower date, UTC date or RFC 3339 timestamp with timezone
+    #[arg(long, alias = "since-utc")]
+    pub since: Option<String>,
+    /// Exclusive upper date, UTC date or RFC 3339 timestamp with timezone
+    #[arg(long)]
+    pub until: Option<String>,
+    /// Opaque continuation returned by the previous page
+    #[arg(long)]
+    pub cursor: Option<String>,
+    #[arg(long, default_value = "20", value_parser = clap::value_parser!(i32).range(1..=100))]
+    pub limit: i32,
+}
+
+#[derive(Parser, Debug)]
+pub struct HistoryArgs {
+    /// Exact @username. Omit source when continuing a cursor.
+    #[arg(conflicts_with = "chat", required_unless_present_any = ["chat", "cursor"])]
+    pub username: Option<String>,
+    #[arg(long, allow_hyphen_values = true)]
+    pub chat: Option<i64>,
+    #[command(flatten)]
+    pub page: PageArgs,
+}
+
+#[derive(Parser, Debug)]
+pub struct ThreadArgs {
+    /// Telegram URL of the channel post. Omit when continuing a cursor.
+    #[arg(required_unless_present = "cursor")]
+    pub link: Option<String>,
+    #[command(flatten)]
+    pub page: PageArgs,
+}
+
+#[derive(Parser, Debug)]
 pub struct ReactArgs {
     /// The emoji to react with, or with --remove the one to take back
     /// (omit it there to take back whatever reaction you have on the message)
@@ -285,6 +342,50 @@ pub struct SyncArgs {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn parse_bounded_reads_and_legacy_contracts() {
+        use super::*;
+        assert!(
+            Cli::try_parse_from([
+                "tg",
+                "history",
+                "@channel",
+                "--since",
+                "2026-11-12",
+                "--until",
+                "2026-11-13",
+                "--limit",
+                "2"
+            ])
+            .is_ok()
+        );
+        assert!(Cli::try_parse_from(["tg", "history", "--chat", "-1001943579488"]).is_ok());
+        assert!(Cli::try_parse_from(["tg", "history", "--cursor", "opaque"]).is_ok());
+        assert!(Cli::try_parse_from(["tg", "thread", "--cursor", "opaque"]).is_ok());
+        assert!(
+            Cli::try_parse_from([
+                "tg",
+                "thread",
+                "https://t.me/channel/1",
+                "--until",
+                "2026-11-13"
+            ])
+            .is_ok()
+        );
+        for argv in [
+            vec!["tg", "history"],
+            vec!["tg", "history", "@a", "--chat", "1"],
+            vec!["tg", "thread"],
+            vec!["tg", "history", "@a", "--limit", "101"],
+            vec!["tg", "history", "@a", "--limit", "0"],
+        ] {
+            assert!(Cli::try_parse_from(argv).is_err());
+        }
+        assert!(Cli::try_parse_from(["tg", "messages", "@channel", "--json"]).is_ok());
+        assert!(
+            Cli::try_parse_from(["tg", "message", "--chat", "-1001", "--message", "42"]).is_ok()
+        );
+    }
     use super::*;
     use clap::CommandFactory;
 

@@ -4,6 +4,43 @@ How `tg` pages a chat's history (`messages`, `tg sync`) and tells a deleted chat
 The rules every change keeps are in [AGENTS.md](../../AGENTS.md); this file is how it works as
 built.
 
+## Bounded reads
+
+`src/reads.rs` owns the new `history` and `thread` page contract. The one-shot CLI
+and serve dispatcher call the same handlers. `TelegramClient` provides public
+resolution, link resolution, discussion metadata and raw bounded history batches;
+`HistorySource` lets pagination tests model cold caches and short pages without
+opening TDLib. Message conversion still uses `message_infos` and `message_info`.
+
+`history` resolves exact usernames with `searchPublicChat`. `message-link` uses
+`getMessageLinkInfo`, including its access checks and ID conversion.
+`getMessageThread` supplies the discussion chat, thread ID and root messages;
+`getMessageThreadHistory` is addressed by the original post's chat and message.
+It returns comments in the discussion chat. These are separate identities, never
+derived by shifting an ID from a URL. These fields and call signatures come from
+the `td_api.tl` pinned by tdlib-rs 1.3.0, TDLib 1.8.61.
+
+Pages walk backwards with `offset = 0`. They keep the last consumed ID and leave
+the lookahead message unconsumed. Roots and messages outside the date window do
+not consume the output limit. A bounded start-of-history probe uses the forward
+window described below, anchored at `1 << 20` for chats and at the first root for
+threads. Reaching its smallest returned ID proves that the backwards walk reached
+the beginning. The probe runs again on continuation; an untrusted cursor cannot
+invent an exhaustion marker. Short or empty batches never prove exhaustion.
+
+The scan uses at most five start probes and twenty backwards requests per page.
+Five consecutive empty backwards responses end the page as incomplete. An
+unresolved beginning, including an empty chat, can require a retry even when no
+messages exist. This conservative answer avoids confusing a cache gap with the
+end. The README defines `has_more`, `incomplete`, date rounding and caller-owned
+cursor semantics. Bounds live in the cursor as whole seconds after rounding up,
+so fractional inclusive lower and exclusive upper bounds compare correctly with
+integer message timestamps. Source and position IDs must fit TDLib's int53 range.
+
+Public resolution and the post/discussion identities were checked against
+`@llm_under_hood` and post 993 using read-only TDLib calls. No method in this path
+joins a channel, opens a chat for viewing, calls `viewMessages`, or changes read state.
+
 **TDLib `getChatHistory` quirk:** May return fewer messages than `limit` on the first call while syncing from the server. Always use a retry+pagination loop: retry on empty responses (up to 5×), and page using the oldest returned message ID as the next `from_message_id`.
 
 **TDLib `getChatHistory` offsets, and walking forward (`tg sync --oldest-first`, since 0.9.0):**

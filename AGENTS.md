@@ -51,6 +51,8 @@ GitHub issues moved here as `tg-gh<N>`, keeping their numbers). Storage, the Dol
   mapping)
 - `serve_client.rs` - The CLI's side of the socket: one request per connection, plus `stream` for
   `tg stream`
+- `reads.rs` - Public username and message-link reads, discussion identities, date windows and
+  bounded history pages with caller-owned cursors. See [history.md](docs/architecture/history.md).
 
 `tests/serve_integration.rs` runs the serve protocol over real sockets against a stub server;
 `tests/agents_md.rs` keeps this file small ("Docs").
@@ -81,7 +83,8 @@ and `~/.local/share/tg` on Linux), including `credentials.json`
   text path's semantics stay as they are: other callers depend on them
   ([sending.md](docs/architecture/sending.md)).
 - **The requests that change a chat are strict**: `SendRequest`, `media::SendFile`, `ReactRequest`
-  and `DeleteChatRequest` carry `#[serde(deny_unknown_fields)]`; the others stay open on purpose
+  and `DeleteChatRequest` carry `#[serde(deny_unknown_fields)]`. New requests in `reads.rs` also
+  reject unknown fields so misspelled filters fail. Existing read requests stay open on purpose
   (`WhoamiRequest` backs the container's health check; [serve.md](docs/architecture/serve.md)).
 - **`tg stream` never opens a TDLib client of its own**: a second client on serve's database is
   the one thing it must never open.

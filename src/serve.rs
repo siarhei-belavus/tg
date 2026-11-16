@@ -261,6 +261,10 @@ pub async fn dispatch<C: TelegramClient>(client: &C, env: RequestEnvelope) -> Re
         "search" => execute(env.args, |r| search::handle(client, r)).await,
         "messages" => execute(env.args, |r| messages::handle(client, r)).await,
         "message" => execute(env.args, |r| message::handle(client, r)).await,
+        "resolve_public" => execute(env.args, |r| crate::reads::resolve(client, r)).await,
+        "message_link" => execute(env.args, |r| crate::reads::message_link(client, r)).await,
+        "history_page" => execute(env.args, |r| crate::reads::history(client, r)).await,
+        "thread_page" => execute(env.args, |r| crate::reads::thread(client, r)).await,
         "send" => execute(env.args, |r| send::handle(client, r)).await,
         "react" => execute(env.args, |r| react::handle(client, r)).await,
         "download" => execute(env.args, |r| download::handle(client, r)).await,
@@ -310,6 +314,155 @@ where
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn bounded_reads_share_the_dispatcher_without_changing_legacy_arrays() {
+        let mut client = MockClient::default();
+        let original = client.messages[0].clone();
+        let link = "https://t.me/example/77";
+        client
+            .message_links
+            .insert(link.into(), (original.chat_id, original.id));
+        let response = dispatch(&client, req("link", "message_link", json!({"link":link}))).await;
+        assert!(response.ok, "{:?}", response.error);
+        assert_eq!(response.result.unwrap()["id"], original.id);
+        let inaccessible = dispatch(
+            &client,
+            req(
+                "bad",
+                "message_link",
+                json!({"link":"https://t.me/c/111/999"}),
+            ),
+        )
+        .await;
+        assert!(!inaccessible.ok);
+        assert!(inaccessible.error.unwrap().contains("inaccessible"));
+        let username = format!("@{}", client.contacts[0].username.as_deref().unwrap());
+        let resolved = dispatch(
+            &client,
+            req("public", "resolve_public", json!({"username":username})),
+        )
+        .await;
+        assert!(resolved.ok, "{:?}", resolved.error);
+        let first = dispatch(
+            &client,
+            req(
+                "page",
+                "history_page",
+                json!({"chat":original.chat_id,"limit":1}),
+            ),
+        )
+        .await;
+        assert!(first.ok, "{:?}", first.error);
+        let first = first.result.unwrap();
+        assert_eq!(first["messages"].as_array().unwrap().len(), 1);
+        assert_eq!(first["has_more"], true);
+        let second = dispatch(
+            &client,
+            req(
+                "next",
+                "history_page",
+                json!({"cursor":first["next_cursor"],"limit":1}),
+            ),
+        )
+        .await;
+        assert!(second.ok, "{:?}", second.error);
+        let second = second.result.unwrap();
+        assert_eq!(second["has_more"], false);
+        assert_ne!(first["messages"][0]["id"], second["messages"][0]["id"]);
+        let legacy = dispatch(
+            &client,
+            req("legacy", "messages", json!({"chat":original.chat_id})),
+        )
+        .await;
+        assert!(legacy.result.unwrap().is_array());
+        let bad = dispatch(
+            &client,
+            req(
+                "filter",
+                "history_page",
+                json!({"chat":1,"until_typo":"2026-11-13"}),
+            ),
+        )
+        .await;
+        assert!(!bad.ok);
+    }
+
+    #[tokio::test]
+    async fn discussion_pages_preserve_post_chat_thread_and_root_identity() {
+        let mut client = MockClient::default();
+        let mut post = client.messages[0].clone();
+        post.chat_id = -1001;
+        post.id = 77;
+        let mut root = post.clone();
+        root.chat_id = -1002;
+        root.id = 500;
+        let source = crate::reads::Source::Thread {
+            post_chat_id: -1001,
+            post_message_id: 77,
+            chat_id: -1002,
+            thread_id: 500,
+            root_ids: vec![500],
+        };
+        client.messages.push(root.clone());
+        for id in [501, 502, 503] {
+            let mut comment = root.clone();
+            comment.id = id;
+            client.messages.push(comment);
+        }
+        client
+            .message_links
+            .insert("https://t.me/example/77".into(), (-1001, 77));
+        client.messages.push(post.clone());
+        client.discussions.insert(
+            (-1001, 77),
+            crate::reads::Discussion {
+                source,
+                post,
+                roots: vec![root],
+                reply_count: Some(3),
+            },
+        );
+        let first = dispatch(
+            &client,
+            req(
+                "thread",
+                "thread_page",
+                json!({"link":"https://t.me/example/77","limit":2}),
+            ),
+        )
+        .await;
+        assert!(first.ok, "{:?}", first.error);
+        let first = first.result.unwrap();
+        assert_eq!(first["discussion"]["post"]["chat_id"], -1001);
+        assert_eq!(first["source"]["chat_id"], -1002);
+        assert_eq!(first["source"]["thread_id"], 500);
+        assert_eq!(first["discussion"]["roots"][0]["id"], 500);
+        assert_eq!(first["messages"][0]["id"], 503);
+        let next = dispatch(
+            &client,
+            req(
+                "next",
+                "thread_page",
+                json!({"cursor":first["next_cursor"]}),
+            ),
+        )
+        .await;
+        assert!(next.ok, "{:?}", next.error);
+        let next = next.result.unwrap();
+        assert_eq!(next["messages"].as_array().unwrap().len(), 1);
+        assert_eq!(next["messages"][0]["id"], 501);
+        assert_eq!(next["has_more"], false);
+        let wrong_kind = dispatch(
+            &client,
+            req(
+                "wrong",
+                "history_page",
+                json!({"cursor":first["next_cursor"]}),
+            ),
+        )
+        .await;
+        assert!(!wrong_kind.ok);
+    }
     use super::*;
     use crate::client::mock::MockClient;
     use serde_json::json;

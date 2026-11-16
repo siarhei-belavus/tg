@@ -1,5 +1,12 @@
 # tg
 
+This local build adds login delivery diagnostics. At the code prompt, `/status`
+refreshes TDLib's current delivery method, next method and remaining timeout.
+`/resend` requests the next method only when Telegram offers one and its timeout
+has passed. `/quit` exits without clearing the pending login. No resend occurs
+automatically. The displayed method is Telegram's report, not proof of receipt.
+Phone numbers, login codes and provider tokens are omitted from diagnostics.
+
 A modern CLI tool for interacting with Telegram, built in Rust using [TDLib](https://core.telegram.org/tdlib).
 
 ## Features
@@ -213,6 +220,99 @@ conventionally omits because it is the escape character itself. Two failure mode
 
 ## Machine use
 
+### Public sources, message links and bounded pages
+
+```bash
+tg resolve @llm_under_hood --json
+tg message-link https://t.me/llm_under_hood/993 --json
+tg history @llm_under_hood --since 2026-11-12 --until 2026-11-13 --limit 2
+tg history --chat -1001943579488 --limit 20
+tg history --cursor "$cursor" --limit 20
+tg thread https://t.me/llm_under_hood/993 --limit 2
+tg thread --cursor "$cursor" --limit 2
+```
+
+`resolve` accepts an exact `@username` and returns `{id,title,kind,username}`. It uses
+TDLib's `searchPublicChat`, without joining. `messages @username` also resolves the
+public username. Display-name reads refuse multiple matching contacts and ask for
+an ID or username.
+
+`message-link` uses TDLib's `getMessageLinkInfo` and returns the existing
+`MessageInfo` shape. Public links and accessible private `https://t.me/c/...` links
+work through TDLib's permissions. An inaccessible link or a link without a message
+is an error. Supported URL hosts are `t.me`, `telegram.me` and `telegram.dog`, over
+HTTP or HTTPS. Other schemes, including `tg://`, are explicitly unsupported. An
+album link returns the individual message TDLib resolves, not the whole album.
+
+`history` and `thread` always print a JSON object. Existing `messages --json`
+arrays and the existing `message` command keep their shapes. Use `history` for
+`--until` and bounded pagination. These new commands also work through `tg serve`.
+They use separate socket commands, so an older daemon returns `unknown command`
+instead of silently ignoring filters. Upgrade the daemon before using them.
+
+The page has this shape, with abbreviated message bodies:
+
+```json
+{
+  "source": {"kind": "chat", "chat_id": -1001943579488},
+  "messages": [{"id": 1039138816, "chat_id": -1001943579488}],
+  "has_more": true,
+  "next_cursor": "opaque-continuation",
+  "incomplete": false
+}
+```
+
+Messages are newest first, in decreasing TDLib message ID order. `--limit` is
+1 through 100, default 20. `--since`, also spelled `--since-utc`, is inclusive;
+`--until` is exclusive. A date such as `2026-11-12` means midnight UTC. Timestamps
+must include a timezone, for example `2026-11-12T10:00:00+01:00`. Fractional seconds
+are accepted and compared against Telegram's whole-second message dates. Equal,
+reversed, malformed and out-of-range input bounds are errors.
+
+Pass `next_cursor` unchanged to the same command. The cursor carries source IDs,
+date bounds and position. Source and date arguments can be omitted on continuation;
+if supplied, they must agree with the cursor. Page size may change. The tool writes
+no checkpoint files or monitoring database. The caller owns cursor storage,
+scheduling, source mappings and interpretation. Cursors contain no credentials or
+message bodies; they are versioned, size-limited and validated, not encrypted.
+
+`has_more: false` means this read reached the beginning of history or crossed the
+lower date bound. Its `next_cursor` is null. `has_more: true` with
+`incomplete: false` means another matching message was found. `incomplete: true`
+means the bounded scan or cache retry budget ended before an answer was established.
+That page can be short or empty. Continue its cursor to finish scanning. A cold
+or empty history can remain incomplete if TDLib cannot establish its beginning;
+an empty cache response is never treated as proof that history ended.
+
+Each page makes at most five start-of-history probes and twenty history requests,
+each requesting at most 100 messages. It never walks an entire unbounded history
+just to choose a small page. A distant `--until` can require several incomplete
+pages. An unchanged history has no duplicate or missing messages across continued
+pages. Later appends fall above the continuation position; restart to see them.
+Edits, deletions and permission changes are not a snapshot and can affect results.
+
+`thread` resolves the post and asks TDLib for its linked discussion. Its page adds
+`discussion: {source,post,roots,reply_count}`. The source has
+`{kind:"thread",post_chat_id,post_message_id,chat_id,thread_id,root_ids}`.
+The channel post, discussion chat and thread IDs are separate. `roots` identifies
+the messages starting the discussion; `messages` contains comments only and the
+limit counts comments only. Roots and the original post are returned separately
+on every page. `reply_count` is TDLib's metadata, not a pagination cursor. An
+unavailable discussion is an error. No read joins a channel or marks messages read.
+
+Socket commands use the existing request and response envelopes:
+
+| Command | Args | Result |
+| --- | --- | --- |
+| `resolve_public` | `{"username":"@llm_under_hood"}` | Public chat metadata |
+| `message_link` | `{"link":"https://t.me/llm_under_hood/993"}` | `MessageInfo` |
+| `history_page` | `{"username":"@llm_under_hood","since":"2026-11-12","until":"2026-11-13","limit":2}` | Page |
+| `thread_page` | `{"link":"https://t.me/llm_under_hood/993","limit":2}` | Page with discussion |
+
+Page args also accept `chat` instead of `username` for history, and `cursor` for
+continuation. New request types reject unknown fields. Legacy request parsing
+keeps its existing permissiveness. No stream event shapes change.
+
 `tg serve` runs a long-lived background process that keeps one TDLib client warm and exposes it over a Unix socket. Every other `tg <cmd>` automatically routes through it when it's up — and falls back to in-process TDLib (today's behaviour) when it isn't. Nothing breaks without the server; what only it does is ring `subscribe`'s live events and poll group reactions (see *Reactions*).
 
 ### Running the server
@@ -259,7 +359,13 @@ A refusal whose caller acts on why carries the reason as one word, `code`, besid
 `error` (since 0.17.0): `{"id": "1", "ok": false, "code": "newer_messages", "error": "…"}`.
 Only [`delete_chat`](#delete_chat-since-0170) refuses so. Every other failure has no `code`.
 
-`cmd` is one of: `whoami`, `chats`, `groups`, `unread`, `search`, `messages`, `message`, `send`, `react`, `download`, `mark_read`, `mark_unread`, `delete_chat`, `sync`, `subscribe`. `args` field names are snake_case and match the corresponding CLI flags. The `result` shape matches each command's `--json` output today. `subscribe` is different: it turns the connection into an event stream — see [Live events](#live-events-subscribe-and-tg-stream-since-0110).
+`cmd` is one of: `whoami`, `chats`, `groups`, `unread`, `search`, `messages`, `message`,
+`resolve_public`, `message_link`, `history_page`, `thread_page`, `send`, `react`,
+`download`, `mark_read`, `mark_unread`, `delete_chat`, `sync`, `subscribe`.
+`args` field names are snake_case. The new bounded-read commands use the arguments
+listed above; existing commands match their CLI flags. The `result` shape matches
+each command's JSON output. `subscribe` turns the connection into an event stream.
+See [Live events](#live-events-subscribe-and-tg-stream-since-0110).
 
 `send` rejects unknown `args` keys rather than ignoring them:
 
@@ -267,9 +373,11 @@ Only [`delete_chat`](#delete_chat-since-0170) refuses so. Every other failure ha
 {"id": "1", "ok": false, "error": "invalid args: unknown field `x`, expected one of `message`, `name`, `id`, `to`, `group`, `parse_mode`, `files`, `reply_to`"}
 ```
 
-So do [`react`](#react-since-0120) and [`delete_chat`](#delete_chat-since-0170). The other commands still ignore unknown keys. For a
-recipient or identity field, a silent drop means a message delivered to the wrong place with
-`ok: true`, which is worse than a refusal the caller can retry.
+So do [`react`](#react-since-0120), [`delete_chat`](#delete_chat-since-0170),
+`resolve_public`, `message_link`, `history_page` and `thread_page`. Other existing
+commands still ignore unknown keys. Rejecting unknown recipient fields prevents
+delivery to the wrong place; rejecting unknown page filters prevents reading an
+unintended date range.
 
 #### `send` with attachments
 

@@ -211,6 +211,44 @@ async fn route_via_serve(command: Command, stream: UnixStream, format: OutputFor
             let msg: MessageInfo = serve_client::send_request(stream, "message", req).await?;
             print_output(format, &msg);
         }
+        Command::Resolve(args) => {
+            let result: tg::reads::PublicChat = serve_client::send_request(
+                stream,
+                "resolve_public",
+                tg::reads::ResolveRequest {
+                    username: args.username,
+                },
+            )
+            .await?;
+            print_output(format, &result);
+        }
+        Command::MessageLink(args) => {
+            let result: MessageInfo = serve_client::send_request(
+                stream,
+                "message_link",
+                tg::reads::LinkRequest { link: args.link },
+            )
+            .await?;
+            print_output(format, &result);
+        }
+        Command::History(args) => {
+            let result: tg::reads::Page = serve_client::send_request(
+                stream,
+                "history_page",
+                tg::reads::PageRequest::from(args),
+            )
+            .await?;
+            print_output(OutputFormat::Json, &result);
+        }
+        Command::Thread(args) => {
+            let result: tg::reads::Page = serve_client::send_request(
+                stream,
+                "thread_page",
+                tg::reads::PageRequest::from(args),
+            )
+            .await?;
+            print_output(OutputFormat::Json, &result);
+        }
         Command::Send(args) => {
             // Bot sends are filtered out before route_via_serve.
             let req = send::SendRequest::from(args);
@@ -540,6 +578,33 @@ async fn run_command(
             client.start().await?;
             let msg = message::get_message(client, args.chat, args.message).await?;
             print_output(format, &msg);
+        }
+        Command::Resolve(args) => {
+            client.start().await?;
+            let result = tg::reads::resolve(
+                client,
+                tg::reads::ResolveRequest {
+                    username: args.username,
+                },
+            )
+            .await?;
+            print_output(format, &result);
+        }
+        Command::MessageLink(args) => {
+            client.start().await?;
+            let result =
+                tg::reads::message_link(client, tg::reads::LinkRequest { link: args.link }).await?;
+            print_output(format, &result);
+        }
+        Command::History(args) => {
+            client.start().await?;
+            let result = tg::reads::history(client, args.into()).await?;
+            print_output(OutputFormat::Json, &result);
+        }
+        Command::Thread(args) => {
+            client.start().await?;
+            let result = tg::reads::thread(client, args.into()).await?;
+            print_output(OutputFormat::Json, &result);
         }
 
         Command::React(args) => {

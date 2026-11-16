@@ -1,4 +1,5 @@
 pub mod auth;
+pub mod auth_code;
 pub mod bot_api;
 pub mod cli;
 pub mod client;
@@ -12,6 +13,7 @@ pub mod parse_mode;
 pub mod reaction_changes;
 pub mod reaction_poll;
 pub mod reactions;
+pub mod reads;
 pub mod resolve;
 pub mod serve;
 pub mod serve_client;
